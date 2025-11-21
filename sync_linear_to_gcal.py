@@ -2,7 +2,7 @@
 """
 sync_linear_to_gcal.py
 
-- Récupère issues et projects depuis Linear (GraphQL)
+- Récupère les issues depuis Linear (GraphQL) avec métadonnées enrichies
 - Crée ou met à jour des événements Google Calendar en évitant les doublons
 - Support: GOOGLE_APPLICATION_CREDENTIALS (path) ou GOOGLE_SERVICE_ACCOUNT_JSON (content)
 - Secrets attendus: LINEAR_API_KEY, either GOOGLE_APPLICATION_CREDENTIALS or GOOGLE_SERVICE_ACCOUNT_JSON
@@ -12,7 +12,7 @@ sync_linear_to_gcal.py
 import os
 import json
 import requests
-from datetime import datetime, timedelta, date
+from datetime import datetime, timedelta, date, time as dt_time
 from dateutil import parser
 import pytz
 from google.oauth2 import service_account
@@ -26,7 +26,6 @@ GOOGLE_SERVICE_ACCOUNT_JSON = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON")
 GOOGLE_APPLICATION_CREDENTIALS = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS")
 LINEAR_GRAPHQL_URL = "https://api.linear.app/graphql"
 TIMEZONE = os.environ.get("TIMEZONE", "UTC")
-# fenêtre de recherche (en jours) autour de la date cible pour la recherche d'événements
 SEARCH_WINDOW_DAYS = int(os.environ.get("SEARCH_WINDOW_DAYS", "365"))
 
 if not LINEAR_API_KEY:
@@ -34,7 +33,6 @@ if not LINEAR_API_KEY:
 
 def build_gcal_service():
     credentials = None
-    # prefer file path
     if GOOGLE_APPLICATION_CREDENTIALS and os.path.exists(GOOGLE_APPLICATION_CREDENTIALS):
         credentials = service_account.Credentials.from_service_account_file(
             GOOGLE_APPLICATION_CREDENTIALS, scopes=["https://www.googleapis.com/auth/calendar"]
@@ -56,8 +54,8 @@ def build_gcal_service():
 
 def linear_query(query, variables=None):
     headers = {
-    "Authorization": LINEAR_API_KEY,
-    "Content-Type": "application/json"
+        "Authorization": LINEAR_API_KEY,
+        "Content-Type": "application/json"
     }
     payload = {"query": query, "variables": variables or {}}
     resp = requests.post(LINEAR_GRAPHQL_URL, json=payload, headers=headers, timeout=30)
@@ -72,17 +70,54 @@ def linear_query(query, variables=None):
         raise RuntimeError("Linear GraphQL returned errors")
     return data
 
-def get_issues_with_due(limit=200):
+def get_issues_with_metadata(limit=200):
+    """
+    Récupère les issues avec toutes les métadonnées enrichies:
+    - description de l'issue
+    - projet (nom + description)
+    - parent issue
+    - sub-issues (children)
+    - labels
+    - dueDate (date de livraison)
+    """
     query = """
-    query($limit:Int) {
-      issues(first:$limit) {
+    query($limit: Int) {
+      issues(first: $limit) {
         nodes {
           id
           title
           description
           url
           dueDate
-          project { name }
+          createdAt
+          startedAt
+          completedAt
+          project {
+            id
+            name
+            description
+            url
+            targetDate
+          }
+          parent {
+            id
+            title
+            url
+          }
+          children {
+            nodes {
+              id
+              title
+              url
+            }
+          }
+          labels {
+            nodes {
+              id
+              name
+              color
+            }
+          }
         }
       }
     }
@@ -90,53 +125,82 @@ def get_issues_with_due(limit=200):
     res = linear_query(query, {"limit": limit})
     return res.get("data", {}).get("issues", {}).get("nodes", [])
 
-def get_projects_with_target(limit=100):
-    query = """
-    query($limit:Int) {
-      projects(first:$limit) {
-        nodes {
-          id
-          name
-          description
-          url
-          targetDate
-        }
-      }
-    }
-    """
-    res = linear_query(query, {"limit": limit})
-    return res.get("data", {}).get("projects", {}).get("nodes", [])
-
 def to_rfc3339(dt: datetime):
+    """
+    Ensure datetime is timezone-aware and return RFC3339 string
+    """
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=pytz.UTC)
     return dt.astimezone(pytz.UTC).isoformat()
 
 def make_search_window_for_date(target_iso: str, days=SEARCH_WINDOW_DAYS):
     """Return (timeMin, timeMax) RFC3339 around target_iso"""
-    # parse date-only or datetime
+    if not target_iso:
+        now = datetime.utcnow().replace(tzinfo=pytz.UTC)
+        return to_rfc3339(now - timedelta(days=days)), to_rfc3339(now + timedelta(days=days))
     if "T" in target_iso:
         t = parser.isoparse(target_iso)
+        if t.tzinfo is None:
+            t = t.replace(tzinfo=pytz.UTC)
         time_min = t - timedelta(days=days)
         time_max = t + timedelta(days=days)
     else:
         d = parser.isoparse(target_iso).date()
-        # use midday UTC to cover timezone shifts
-        time_min = datetime.combine(d - timedelta(days=days), datetime.min.time()).replace(tzinfo=pytz.UTC)
-        time_max = datetime.combine(d + timedelta(days=days), datetime.max.time()).replace(tzinfo=pytz.UTC)
+        time_min = datetime.combine(d - timedelta(days=days), dt_time.min).replace(tzinfo=pytz.UTC)
+        time_max = datetime.combine(d + timedelta(days=days), dt_time.max).replace(tzinfo=pytz.UTC)
     return to_rfc3339(time_min), to_rfc3339(time_max)
+
+def get_best_date_for_issue(issue):
+    """
+    Détermine la meilleure date à utiliser pour l'événement calendar.
+    Ordre de priorité:
+    1. dueDate (date d'échéance de l'issue)
+    2. targetDate du projet associé
+    3. completedAt (si l'issue est terminée)
+    4. startedAt (si l'issue est en cours)
+    5. createdAt (date de création en dernier recours)
+
+    Retourne (date_iso_string, source_name) ou (None, None)
+    """
+    if not isinstance(issue, dict):
+        return None, None
+
+    if issue.get("dueDate"):
+        return issue["dueDate"], "dueDate"
+
+    project = issue.get("project") or {}
+    if project.get("targetDate"):
+        return project["targetDate"], "project_targetDate"
+
+    if issue.get("completedAt"):
+        return issue["completedAt"], "completedAt"
+
+    if issue.get("startedAt"):
+        return issue["startedAt"], "startedAt"
+
+    if issue.get("createdAt"):
+        return issue["createdAt"], "createdAt"
+
+    return None, None
 
 def find_event_by_linear_id(service, calendar_id, linear_id, target_date_iso=None):
     """
-    Uses privateExtendedProperty to find an event with linear_id.
-    If target_date_iso provided, we restrict the time window around it for efficiency.
-    Returns the first matching event or None.
+    Trouve un événement Google Calendar ayant privateExtendedProperty linear_id=<linear_id>.
+    Si target_date_iso fourni, on restreint la fenêtre de recherche autour de cette date.
+    Retourne l'objet événement trouvé ou None.
     """
-    # If we have a date, build a tight window; otherwise use +/- SEARCH_WINDOW_DAYS from today
+    if not service or not calendar_id or not linear_id:
+        return None
+
     if target_date_iso:
         time_min, time_max = make_search_window_for_date(target_date_iso)
     else:
-        now = datetime.utcnow()
+        now = datetime.utcnow().replace(tzinfo=pytz.UTC)
         time_min = to_rfc3339(now - timedelta(days=SEARCH_WINDOW_DAYS))
         time_max = to_rfc3339(now + timedelta(days=SEARCH_WINDOW_DAYS))
+
     page_token = None
     while True:
         try:
@@ -152,113 +216,211 @@ def find_event_by_linear_id(service, calendar_id, linear_id, target_date_iso=Non
         except HttpError as e:
             print("Error while searching events:", e)
             raise
-        items = resp.get("items", [])
+
+        items = resp.get("items", []) or []
         if items:
             return items[0]
         page_token = resp.get("nextPageToken")
         if not page_token:
             break
+
     return None
 
-def build_event_body_from_linear(item, kind="issue"):
+def format_rich_description(issue):
     """
-    Build Google event body from Linear item. Handles date-only and dateTime values.
-    Returns None if no date present.
+    Construit une description enrichie pour l'événement Google Calendar
+    avec toutes les métadonnées de l'issue
     """
-    linear_id = item.get("id")
-    title = item.get("title") or item.get("name") or "No title"
-    description = item.get("description") or ""
-    url = item.get("url") or ""
-    date_field = item.get("dueDate") if kind == "issue" else item.get("targetDate")
-    if not date_field:
+    parts = []
+
+    # safe access
+    issue = issue or {}
+    description_text = issue.get("description") or ""
+    if description_text:
+        parts.append("📝 Description de l'issue:")
+        parts.append(description_text)
+        parts.append("")
+
+    project = issue.get("project") or {}
+    if project:
+        parts.append("📁 Projet:")
+        parts.append(f"  • {project.get('name', 'N/A')}")
+        if project.get("description"):
+            parts.append(f"  • Description: {project['description']}")
+        if project.get("url"):
+            parts.append(f"  • Lien: {project['url']}")
+        parts.append("")
+
+    parent = issue.get("parent") or {}
+    if parent and parent.get("title"):
+        parts.append("⬆️ Issue parente:")
+        parts.append(f"  • {parent.get('title', 'N/A')}")
+        if parent.get("url"):
+            parts.append(f"  • Lien: {parent['url']}")
+        parts.append("")
+
+    children = (issue.get("children") or {}).get("nodes") or []
+    if children:
+        parts.append("⬇️ Sous-issues:")
+        for child in children:
+            child = child or {}
+            parts.append(f"  • {child.get('title', 'N/A')}")
+            if child.get("url"):
+                parts.append(f"    {child['url']}")
+        parts.append("")
+
+    labels = (issue.get("labels") or {}).get("nodes") or []
+    if labels:
+        parts.append("🏷️ Labels:")
+        for label in labels:
+            label = label or {}
+            label_text = f"  • {label.get('name', 'N/A')}"
+            if label.get("color"):
+                label_text += f" (#{label['color']})"
+            parts.append(label_text)
+        parts.append("")
+
+    if issue.get("url"):
+        parts.append("🔗 Lien Linear:")
+        parts.append(issue["url"])
+
+    return "\n".join(parts)
+
+def build_event_body_from_issue(issue):
+    """
+    Build Google event body from Linear issue with enriched metadata.
+    Uses dueDate primarily (consistent with original behavior).
+    Returns None if no usable date present.
+    """
+    if not isinstance(issue, dict):
         return None
 
-    # If date-time present
-    if "T" in date_field:
-        start_dt = parser.isoparse(date_field)
-        # default duration: 1 hour
+    linear_id = issue.get("id")
+    title = issue.get("title") or "No title"
+    due_date = issue.get("dueDate")
+
+    if not due_date:
+        return None
+
+    description = format_rich_description(issue)
+
+    # date/time handling
+    if "T" in due_date:
+        try:
+            start_dt = parser.isoparse(due_date)
+            if start_dt.tzinfo is None:
+                start_dt = start_dt.replace(tzinfo=pytz.UTC)
+        except Exception:
+            # fallback parse as date
+            start_dt = datetime.utcnow().replace(tzinfo=pytz.UTC)
         end_dt = start_dt + timedelta(hours=1)
         start = {"dateTime": to_rfc3339(start_dt), "timeZone": TIMEZONE}
         end = {"dateTime": to_rfc3339(end_dt), "timeZone": TIMEZONE}
     else:
-        # all-day event: Google expects end = next day (exclusive)
-        d = parser.isoparse(date_field).date()
+        d = parser.isoparse(due_date).date()
         start = {"date": d.isoformat()}
         end = {"date": (d + timedelta(days=1)).isoformat()}
 
+    labels = (issue.get("labels") or {}).get("nodes") or []
+    label_names = ",".join([l.get("name", "") for l in labels if isinstance(l, dict) and l.get("name")])
+
+    project = issue.get("project") or {}
+    parent = issue.get("parent") or {}
+
     body = {
         "summary": title,
-        "description": f"{description}\n\n{url}",
+        "description": description,
         "start": start,
         "end": end,
         "extendedProperties": {
             "private": {
-                "linear_id": linear_id,
-                "linear_kind": kind,
-                "linear_url": url
+                "linear_id": linear_id or "",
+                "linear_kind": "issue",
+                "linear_url": issue.get("url", ""),
+                "project_id": project.get("id", ""),
+                "project_name": project.get("name", ""),
+                "parent_id": parent.get("id", ""),
+                "labels": label_names
             }
         }
     }
     return body
 
-def upsert_event_for_linear_item(service, calendar_id, item, kind="issue"):
-    body = build_event_body_from_linear(item, kind=kind)
-    if not body:
-        print(f"Skipping {kind} {item.get('id')} — no date present")
+def upsert_event_for_issue(service, calendar_id, issue):
+    """
+    Crée ou met à jour un événement Google Calendar pour une issue Linear.
+    Utilise la dueDate de l'issue.
+    """
+    if not isinstance(issue, dict):
         return None
-    linear_id = item.get("id")
-    date_field = item.get("dueDate") if kind == "issue" else item.get("targetDate")
-    existing = find_event_by_linear_id(service, calendar_id, linear_id, target_date_iso=date_field)
+
+    linear_id = issue.get("id")
+    title = issue.get("title", "Sans titre")
+    due_date = issue.get("dueDate")
+
+    if not due_date:
+        print(f"⏭️  Skipping issue '{title}' (ID: {linear_id}) — pas de dueDate définie dans Linear")
+        return None
+
+    body = build_event_body_from_issue(issue)
+    if not body:
+        print(f"⚠️  Could not build event body for issue {linear_id}")
+        return None
+
+    existing = find_event_by_linear_id(service, calendar_id, linear_id, target_date_iso=due_date)
+
     if existing:
-        event_id = existing["id"]
+        event_id = existing.get("id")
         try:
             updated = service.events().patch(calendarId=calendar_id, eventId=event_id, body=body).execute()
-            print(f"Updated event {event_id} for linear {linear_id}")
+            print(f"✅ Updated: '{title}' (dueDate: {due_date})")
             return updated
         except HttpError as e:
-            print(f"Failed to update event {event_id}: {e}")
+            print(f"❌ Failed to update event {event_id}: {e}")
             raise
     else:
         try:
             created = service.events().insert(calendarId=calendar_id, body=body).execute()
-            print(f"Created event {created.get('id')} for linear {linear_id}")
+            print(f"✨ Created: '{title}' (dueDate: {due_date})")
             return created
         except HttpError as e:
-            print(f"Failed to create event for linear {linear_id}: {e}")
+            print(f"❌ Failed to create event for issue {linear_id}: {e}")
             raise
 
 def main():
     service = build_gcal_service()
 
-    print("Fetching Linear issues...")
+    print("🔍 Fetching Linear issues with metadata...")
     try:
-        issues = get_issues_with_due(limit=200)
+        issues = get_issues_with_metadata(limit=200)
     except Exception as e:
-        print("Error fetching issues:", e)
-        issues = []
-    print(f"Found {len(issues)} issues returned by Linear")
+        print(f"❌ Error fetching issues: {e}")
+        raise
 
-    for i in issues:
+    print(f"📊 Found {len(issues)} issues returned by Linear")
+
+    synced_count = 0
+    skipped_count = 0
+    error_count = 0
+
+    for issue in issues:
         try:
-            if i.get("dueDate"):
-                upsert_event_for_linear_item(service, GCAL_CALENDAR_ID, i, kind="issue")
+            result = upsert_event_for_issue(service, GCAL_CALENDAR_ID, issue)
+            if result:
+                synced_count += 1
+            else:
+                skipped_count += 1
         except Exception as e:
-            print(f"Error processing issue {i.get('id')}: {e}")
+            error_count += 1
+            issue_id = issue.get('id') if isinstance(issue, dict) else '<unknown>'
+            print(f"❌ Error processing issue {issue_id}: {e}")
 
-    print("Fetching Linear projects...")
-    try:
-        projects = get_projects_with_target(limit=100)
-    except Exception as e:
-        print("Error fetching projects:", e)
-        projects = []
-    print(f"Found {len(projects)} projects returned by Linear")
-
-    for p in projects:
-        try:
-            if p.get("targetDate"):
-                upsert_event_for_linear_item(service, GCAL_CALENDAR_ID, p, kind="project")
-        except Exception as e:
-            print(f"Error processing project {p.get('id')}: {e}")
+    print("\n" + "="*50)
+    print("📈 Synchronization Summary:")
+    print(f"  ✅ Synced: {synced_count}")
+    print(f"  ⏭️  Skipped: {skipped_count}")
+    print(f"  ❌ Errors: {error_count}")
+    print("="*50)
 
 if __name__ == "__main__":
     main()
