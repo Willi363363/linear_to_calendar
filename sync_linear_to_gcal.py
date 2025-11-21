@@ -42,10 +42,11 @@ def linear_query(query, variables=None):
         raise RuntimeError(f"Linear API errors: {data['errors']}")
     return data
 
-def get_issues_with_due(limit=100):
+def get_issues_with_due(limit=200):
+    # Query simple : on récupère issues récentes, on filtre ensuite en Python si dueDate présent
     query = """
     query($limit:Int) {
-      issues(first:$limit filter:{dueDate:{notIn:[]}}) {
+      issues(first:$limit, orderBy:{field:updatedAt, direction:desc}) {
         nodes {
           id
           title
@@ -60,10 +61,10 @@ def get_issues_with_due(limit=100):
     res = linear_query(query, {"limit": limit})
     return res.get("data", {}).get("issues", {}).get("nodes", [])
 
-def get_projects_with_target(limit=50):
+def get_projects_with_target(limit=100):
     query = """
     query($limit:Int) {
-      projects(first:$limit filter:{targetDate:{notIn:[]}}) {
+      projects(first:$limit, orderBy:{field:updatedAt, direction:desc}) {
         nodes {
           id
           name
