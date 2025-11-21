@@ -4,49 +4,78 @@ sync_linear_to_gcal.py
 
 - Récupère issues et projects depuis Linear (GraphQL)
 - Crée ou met à jour des événements Google Calendar en évitant les doublons
-- Utilise un Service Account Google passé via la variable d'environnement GOOGLE_SERVICE_ACCOUNT_JSON
-- Secrets attendus: LINEAR_API_KEY, GOOGLE_SERVICE_ACCOUNT_JSON, optional GCAL_CALENDAR_ID
+- Support: GOOGLE_APPLICATION_CREDENTIALS (path) ou GOOGLE_SERVICE_ACCOUNT_JSON (content)
+- Secrets attendus: LINEAR_API_KEY, either GOOGLE_APPLICATION_CREDENTIALS or GOOGLE_SERVICE_ACCOUNT_JSON
+- Optional: GCAL_CALENDAR_ID, TIMEZONE
 """
 
 import os
 import json
 import requests
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, date
 from dateutil import parser
+import pytz
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 
 # Configuration via env
 LINEAR_API_KEY = os.environ.get("LINEAR_API_KEY")
-GOOGLE_SERVICE_ACCOUNT_JSON = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON")
 GCAL_CALENDAR_ID = os.environ.get("GCAL_CALENDAR_ID", "primary")
-
-if not LINEAR_API_KEY or not GOOGLE_SERVICE_ACCOUNT_JSON:
-    raise SystemExit("Missing environment variables: LINEAR_API_KEY and GOOGLE_SERVICE_ACCOUNT_JSON are required")
-
+GOOGLE_SERVICE_ACCOUNT_JSON = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON")
+GOOGLE_APPLICATION_CREDENTIALS = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS")
 LINEAR_GRAPHQL_URL = "https://api.linear.app/graphql"
-# fenêtre de recherche d'événements (aujourd'hui -> +2 ans)
-SEARCH_WINDOW_YEARS = 2
+TIMEZONE = os.environ.get("TIMEZONE", "UTC")
+# fenêtre de recherche (en jours) autour de la date cible pour la recherche d'événements
+SEARCH_WINDOW_DAYS = int(os.environ.get("SEARCH_WINDOW_DAYS", "365"))
+
+if not LINEAR_API_KEY:
+    raise SystemExit("Missing environment variable: LINEAR_API_KEY is required")
+
+def build_gcal_service():
+    credentials = None
+    # prefer file path
+    if GOOGLE_APPLICATION_CREDENTIALS and os.path.exists(GOOGLE_APPLICATION_CREDENTIALS):
+        credentials = service_account.Credentials.from_service_account_file(
+            GOOGLE_APPLICATION_CREDENTIALS, scopes=["https://www.googleapis.com/auth/calendar"]
+        )
+    else:
+        raw = GOOGLE_SERVICE_ACCOUNT_JSON
+        if raw:
+            try:
+                info = json.loads(raw)
+            except json.JSONDecodeError as e:
+                raise SystemExit(f"Invalid GOOGLE_SERVICE_ACCOUNT_JSON: {e}")
+            credentials = service_account.Credentials.from_service_account_info(
+                info, scopes=["https://www.googleapis.com/auth/calendar"]
+            )
+    if not credentials:
+        raise SystemExit("Missing Google credentials: set GOOGLE_APPLICATION_CREDENTIALS (path) or GOOGLE_SERVICE_ACCOUNT_JSON (content)")
+    service = build("calendar", "v3", credentials=credentials, cache_discovery=False)
+    return service
 
 def linear_query(query, variables=None):
     headers = {
-        "Authorization": f"Bearer {LINEAR_API_KEY}",
-        "Content-Type": "application/json"
+    "Authorization": LINEAR_API_KEY,
+    "Content-Type": "application/json"
     }
     payload = {"query": query, "variables": variables or {}}
     resp = requests.post(LINEAR_GRAPHQL_URL, json=payload, headers=headers, timeout=30)
-    resp.raise_for_status()
+    if resp.status_code != 200:
+        print("Linear API request failed")
+        print("Status:", resp.status_code)
+        print("Response body:", resp.text)
+        resp.raise_for_status()
     data = resp.json()
     if "errors" in data:
-        raise RuntimeError(f"Linear API errors: {data['errors']}")
+        print("Linear GraphQL errors:", json.dumps(data["errors"], indent=2))
+        raise RuntimeError("Linear GraphQL returned errors")
     return data
 
 def get_issues_with_due(limit=200):
-    # Query simple : on récupère issues récentes, on filtre ensuite en Python si dueDate présent
     query = """
     query($limit:Int) {
-      issues(first:$limit, orderBy:{field:updatedAt, direction:desc}) {
+      issues(first:$limit) {
         nodes {
           id
           title
@@ -64,7 +93,7 @@ def get_issues_with_due(limit=200):
 def get_projects_with_target(limit=100):
     query = """
     query($limit:Int) {
-      projects(first:$limit, orderBy:{field:updatedAt, direction:desc}) {
+      projects(first:$limit) {
         nodes {
           id
           name
@@ -78,142 +107,158 @@ def get_projects_with_target(limit=100):
     res = linear_query(query, {"limit": limit})
     return res.get("data", {}).get("projects", {}).get("nodes", [])
 
-def build_gcal_service():
-    info = json.loads(GOOGLE_SERVICE_ACCOUNT_JSON)
-    credentials = service_account.Credentials.from_service_account_info(
-        info, scopes=["https://www.googleapis.com/auth/calendar"]
-    )
-    service = build("calendar", "v3", credentials=credentials, cache_discovery=False)
-    return service
+def to_rfc3339(dt: datetime):
+    return dt.astimezone(pytz.UTC).isoformat()
 
-def list_events_in_window(service, time_min, time_max):
-    all_events = []
+def make_search_window_for_date(target_iso: str, days=SEARCH_WINDOW_DAYS):
+    """Return (timeMin, timeMax) RFC3339 around target_iso"""
+    # parse date-only or datetime
+    if "T" in target_iso:
+        t = parser.isoparse(target_iso)
+        time_min = t - timedelta(days=days)
+        time_max = t + timedelta(days=days)
+    else:
+        d = parser.isoparse(target_iso).date()
+        # use midday UTC to cover timezone shifts
+        time_min = datetime.combine(d - timedelta(days=days), datetime.min.time()).replace(tzinfo=pytz.UTC)
+        time_max = datetime.combine(d + timedelta(days=days), datetime.max.time()).replace(tzinfo=pytz.UTC)
+    return to_rfc3339(time_min), to_rfc3339(time_max)
+
+def find_event_by_linear_id(service, calendar_id, linear_id, target_date_iso=None):
+    """
+    Uses privateExtendedProperty to find an event with linear_id.
+    If target_date_iso provided, we restrict the time window around it for efficiency.
+    Returns the first matching event or None.
+    """
+    # If we have a date, build a tight window; otherwise use +/- SEARCH_WINDOW_DAYS from today
+    if target_date_iso:
+        time_min, time_max = make_search_window_for_date(target_date_iso)
+    else:
+        now = datetime.utcnow()
+        time_min = to_rfc3339(now - timedelta(days=SEARCH_WINDOW_DAYS))
+        time_max = to_rfc3339(now + timedelta(days=SEARCH_WINDOW_DAYS))
     page_token = None
     while True:
         try:
             resp = service.events().list(
-                calendarId=GCAL_CALENDAR_ID,
+                calendarId=calendar_id,
                 timeMin=time_min,
                 timeMax=time_max,
+                privateExtendedProperty=f"linear_id={linear_id}",
                 singleEvents=True,
-                maxResults=2500,
-                pageToken=page_token
+                pageToken=page_token,
+                maxResults=250
             ).execute()
         except HttpError as e:
+            print("Error while searching events:", e)
             raise
         items = resp.get("items", [])
-        all_events.extend(items)
+        if items:
+            return items[0]
         page_token = resp.get("nextPageToken")
         if not page_token:
             break
-    return all_events
-
-def find_event_by_linear_id(service, linear_id):
-    now = datetime.utcnow()
-    time_min = now.isoformat() + "Z"
-    future = (now + timedelta(days=365*SEARCH_WINDOW_YEARS)).isoformat() + "Z"
-    events = list_events_in_window(service, time_min, future)
-    for ev in events:
-        ext = ev.get("extendedProperties", {}).get("private", {})
-        if ext.get("linear_id") == linear_id:
-            return ev
     return None
 
-def date_iso_from_iso_or_datevalue(value):
-    # accepte ISO datetime ou date string -> retourne date string YYYY-MM-DD
-    if not value:
+def build_event_body_from_linear(item, kind="issue"):
+    """
+    Build Google event body from Linear item. Handles date-only and dateTime values.
+    Returns None if no date present.
+    """
+    linear_id = item.get("id")
+    title = item.get("title") or item.get("name") or "No title"
+    description = item.get("description") or ""
+    url = item.get("url") or ""
+    date_field = item.get("dueDate") if kind == "issue" else item.get("targetDate")
+    if not date_field:
         return None
-    dt = parser.isoparse(value)
-    return dt.date().isoformat()
 
-def upsert_issue_event(service, issue):
-    linear_id = issue.get("id")
-    if not linear_id:
-        return
-    if not issue.get("dueDate"):
-        return
-    existing = find_event_by_linear_id(service, linear_id)
-    project_name = issue.get("project", {}).get("name") or "NoProject"
-    title = f"[{project_name}] - {issue.get('title')}"
-    start_date = date_iso_from_iso_or_datevalue(issue["dueDate"])
+    # If date-time present
+    if "T" in date_field:
+        start_dt = parser.isoparse(date_field)
+        # default duration: 1 hour
+        end_dt = start_dt + timedelta(hours=1)
+        start = {"dateTime": to_rfc3339(start_dt), "timeZone": TIMEZONE}
+        end = {"dateTime": to_rfc3339(end_dt), "timeZone": TIMEZONE}
+    else:
+        # all-day event: Google expects end = next day (exclusive)
+        d = parser.isoparse(date_field).date()
+        start = {"date": d.isoformat()}
+        end = {"date": (d + timedelta(days=1)).isoformat()}
+
     body = {
         "summary": title,
-        "description": (issue.get("description") or "") + "\n\n" + (issue.get("url") or ""),
-        "start": {"date": start_date},
-        "end": {"date": start_date},
+        "description": f"{description}\n\n{url}",
+        "start": start,
+        "end": end,
         "extendedProperties": {
-            "private": {"linear_id": linear_id, "linear_url": issue.get("url", "")}
+            "private": {
+                "linear_id": linear_id,
+                "linear_kind": kind,
+                "linear_url": url
+            }
         }
     }
-    if existing:
-        try:
-            service.events().patch(calendarId=GCAL_CALENDAR_ID, eventId=existing["id"], body=body).execute()
-            print(f"Updated event for issue {linear_id}")
-        except HttpError as e:
-            print(f"Failed to update event {existing['id']}: {e}")
-    else:
-        try:
-            service.events().insert(calendarId=GCAL_CALENDAR_ID, body=body).execute()
-            print(f"Created event for issue {linear_id}")
-        except HttpError as e:
-            print(f"Failed to create event for issue {linear_id}: {e}")
+    return body
 
-def upsert_project_event(service, project):
-    linear_id = project.get("id")
-    if not linear_id:
-        return
-    if not project.get("targetDate"):
-        return
-    existing = find_event_by_linear_id(service, linear_id)
-    title = f"Project Deadline: {project.get('name')}"
-    start_date = date_iso_from_iso_or_datevalue(project["targetDate"])
-    body = {
-        "summary": title,
-        "description": (project.get("description") or "") + "\n\n" + (project.get("url") or ""),
-        "start": {"date": start_date},
-        "end": {"date": start_date},
-        "extendedProperties": {
-            "private": {"linear_id": linear_id, "linear_url": project.get("url", "")}
-        }
-    }
+def upsert_event_for_linear_item(service, calendar_id, item, kind="issue"):
+    body = build_event_body_from_linear(item, kind=kind)
+    if not body:
+        print(f"Skipping {kind} {item.get('id')} — no date present")
+        return None
+    linear_id = item.get("id")
+    date_field = item.get("dueDate") if kind == "issue" else item.get("targetDate")
+    existing = find_event_by_linear_id(service, calendar_id, linear_id, target_date_iso=date_field)
     if existing:
+        event_id = existing["id"]
         try:
-            service.events().patch(calendarId=GCAL_CALENDAR_ID, eventId=existing["id"], body=body).execute()
-            print(f"Updated project event {linear_id}")
+            updated = service.events().patch(calendarId=calendar_id, eventId=event_id, body=body).execute()
+            print(f"Updated event {event_id} for linear {linear_id}")
+            return updated
         except HttpError as e:
-            print(f"Failed to update project event {existing['id']}: {e}")
+            print(f"Failed to update event {event_id}: {e}")
+            raise
     else:
         try:
-            service.events().insert(calendarId=GCAL_CALENDAR_ID, body=body).execute()
-            print(f"Created project event {linear_id}")
+            created = service.events().insert(calendarId=calendar_id, body=body).execute()
+            print(f"Created event {created.get('id')} for linear {linear_id}")
+            return created
         except HttpError as e:
-            print(f"Failed to create project event {linear_id}: {e}")
+            print(f"Failed to create event for linear {linear_id}: {e}")
+            raise
 
 def main():
     service = build_gcal_service()
+
     print("Fetching Linear issues...")
     try:
         issues = get_issues_with_due(limit=200)
     except Exception as e:
-        print(f"Error fetching issues: {e}")
+        print("Error fetching issues:", e)
         issues = []
-    for issue in issues:
+    print(f"Found {len(issues)} issues returned by Linear")
+
+    for i in issues:
         try:
-            upsert_issue_event(service, issue)
+            if i.get("dueDate"):
+                upsert_event_for_linear_item(service, GCAL_CALENDAR_ID, i, kind="issue")
         except Exception as e:
-            print(f"Error upserting issue {issue.get('id')}: {e}")
+            print(f"Error processing issue {i.get('id')}: {e}")
 
     print("Fetching Linear projects...")
     try:
         projects = get_projects_with_target(limit=100)
     except Exception as e:
-        print(f"Error fetching projects: {e}")
+        print("Error fetching projects:", e)
         projects = []
-    for project in projects:
+    print(f"Found {len(projects)} projects returned by Linear")
+
+    for p in projects:
         try:
-            upsert_project_event(service, project)
+            if p.get("targetDate"):
+                upsert_event_for_linear_item(service, GCAL_CALENDAR_ID, p, kind="project")
         except Exception as e:
-            print(f"Error upserting project {project.get('id')}: {e}")
+            print(f"Error processing project {p.get('id')}: {e}")
 
 if __name__ == "__main__":
     main()
